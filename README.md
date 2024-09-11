@@ -25,7 +25,7 @@
 - 无需支持字节序切换，mstatus.MBE/SBE/UBE可均硬编码为0
 - wip可实现为nop，U模式执行WFI可以立即触发非法指令异常，mstatus.TW可以忽略
 - mconfigptr可硬编码为0，不实现相关功能
-- 性能监视器，xenvcfg，mseccfg，PMP都可以不实现
+- 性能监视器，xenvcfg，mseccfg，PMP都可以不实现，访问相关CSR直接非法指令异常即可
 
 ## 外设实现
 
@@ -40,7 +40,7 @@
 
 ## 编译安装32位工具链
 
-ubuntu软件包安装的工具链不带multilib，没有32位的软浮点等等实现，很难正常进行接下来的编译。
+ubuntu软件包安装的工具链不带multilib，没有32位的软浮点等等实现，且libc中带有压缩指令，很难正常进行接下来的编译。所以我们需要自己编译工具链。
 
 ```
 $ git clone https://github.com/riscv/riscv-gnu-toolchain
@@ -51,11 +51,11 @@ $ git submodule update --init --recursive
 
 ```
 $ cd riscv-gnu-toolchain
-$ ./configure --prefix=/opt/riscv --with-arch=rv32ima --with-abi=ilp32 --enable-multilib
+$ ./configure --prefix=/opt/riscv --with-arch=rv32ima --with-abi=ilp32
 $ sudo make linux -j
 ```
 
-只支持RISCV32-IMA
+这样，工具链将只编译出RV32IMA指令。
 
 ## 构建initramfs
 
@@ -82,11 +82,9 @@ $ make CROSS_COMPILE=riscv32-unknown-linux-gnu- install
 
 编译产物应该就在`_install`目录下了
 
-> TODO: 还是含有C指令，疑似是libc的原因
+### 编译自己的程序
 
-### 编译自己的init程序
-
-> TODO
+直接用我们编译的工具链编译一般的C程序就好了。不过记得要静态编译，因为我们的系统中不包含libc
 
 ### 镜像文件构建
 
@@ -94,9 +92,43 @@ initramfs是和内核打包在一起的。内核编译时可以接受两种initr
 
 #### CPIO镜像
 
+将所有需要打包的文件移动到当前目录下，例如：
+
 ```
-$ mkdir initramfs
+$ cp -r busybox-1.36.1/_install ./initramfs
 $ cd initramfs
+```
+
+将busybox全部挪过来，创建虚拟文件系统的挂载点，预置/dev下的node文件
+
+```
+$ mkdir proc sys dev
+$ cd dev
+$ sudo mknod -m 644 console c 5 1
+$ sudo mknod -m 644 null c 1 3
+$ cd ..
+```
+
+然后我们还需要为linux创建一个init程序放在initramfs的根目录下。由于我们有busybox，可以使用shell脚本
+
+```sh
+#!/bin/sh
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+
+echo "Welcome to CmdBlock's RISC-V 32 mini Linux!"
+
+exec /bin/sh
+```
+
+脚本挂载了必要的虚拟文件系统，输出了一条Hello信息，并运行sh。别忘了加上可执行权限。
+
+当然你也可以在initramfs中加入你自己编译的程序，并可通过shell运行。
+
+接下来打包所有文件并稍微进行一个压缩，得到一个镜像文件
+
+```
 $ find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../initramfs.cpio.gz
 ```
 
@@ -111,13 +143,13 @@ nod /dev/null 644 0 0 c 1 3
 file /init /home/cmdblock/Develop/initramfs-new/hello 755 0 0
 ```
 
-文件列表也可以用find命令生成
+适用于文件比较少的情况，比如只有一个hello程序，打包工作交给Linux内核的构建程序。虽然文件列表也可以用find命令生成，但感觉不如自己打包。
 
 ## 构建Linux内核
 
 直接去kernel.org下载源码并解压，这里的版本是6.10.9
 
-Linux的编译选项基于默认配置调整而来，而非最小配置。这样做会让编译/运行跑的慢一些，但是配置起来比较简单，对于核的实现测试也会更加充分（这点是我猜的，没什么依据）。
+Linux的编译选项基于默认配置调整而来，而非最小配置。这样做会让编译/运行跑的慢一些，但是配置起来比较简单，对于核的实现测试也会更加充分（这点是笔者猜的，没什么依据）。
 
 ```
 $ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- defconfig
@@ -154,7 +186,7 @@ $ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- menuconfig
   - 进入 Serial drivers
     - 打开 Early console using RISC-V SBI
 - 进入 General setup
-  - 将 Initramfs source file(s) 改为镜像文件/描述文件
+  - 将 Initramfs source file(s) 改为镜像文件/描述文件的绝对路径
 
 ```
 $ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j
@@ -174,11 +206,11 @@ $ git checkout release-1.5.x
 
 ### 创建 Platform
 
-进入`platform`目录，将template目录复制一份，重命名为你喜欢的名字，并进入该目录。
+进入`platform`目录，将`template`目录复制一份，重命名为你喜欢的名字，并进入该目录。
 
 - 创建设备树文件`xxx.dts`
   
-  - 可参考`rvcore/rvcore.dts`
+  - 可参考仓库根目录下`rvcore/rvcore.dts`
   - 需要注意的是内核启动参数，`console=hvc0 earlycon=sbi`，这样做允许我们使用简陋的串口仿真模型运行真实的linux
     - 因为所有的输入输出都通过OpenSBI，whose串口驱动十分简单
   - 然后使用`dtc xxx.dts -o xxx.dtb`编译得到设备树blob(`.dtb`)文件
@@ -203,7 +235,7 @@ $ git checkout release-1.5.x
     - ```
       PLATFORM_RISCV_XLEN = 32
       PLATFORM_RISCV_ABI = ilp32
-      PLATFORM_RISCV_ISA = rv32imac_zicsr_zifencei_zicntr
+      PLATFORM_RISCV_ISA = rv32ima_zicsr_zifencei_zicntr
       PLATFORM_RISCV_CODE_MODEL = medany
       ```
 
@@ -221,7 +253,7 @@ $ git checkout release-1.5.x
 
   - 取消`FW_PAYLOAD_PATH`注释，值改为Linux内核镜像文件**绝对路径**
 
-仓库根目录下`rvcore`目录中为一个platform示例。
+仓库根目录下`rvcore`目录为一个platform示例。
 
 ### 编译生成镜像
 
@@ -235,4 +267,4 @@ $ make CROSS_COMPILE=riscv32-unknown-linux-gnu- FW_TEXT_START=0x80000000 PLATFOR
 
 镜像位于`platform/<你喜欢的名字>/firmware/fw_payload.bin`，打包了包括OpenSBI，Linux内核，initramfs在内的全部内容，可以直接在模拟器/RTL仿真中运行！（当然你或许需要一个bootloader）
 
-修改前面步骤的文件内容后可能需要清理构建产物后重新编译：`make clean`，或者更加彻底地，`make distclean`
+修改makefile内容后可能需要清理构建产物后重新编译：`make clean`，或者更加彻底地，`make distclean`

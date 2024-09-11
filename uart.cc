@@ -5,7 +5,8 @@
 // 预置的输入字符串
 static const char *uart_input_ptr = " " // 占位空格字符
                                     "busybox | head -n4\n"
-                                    "ls\n";
+                                    "ls\n"
+                                    "./hello\n";
 
 static inline bool input_available() {
   return *uart_input_ptr != '\0';
